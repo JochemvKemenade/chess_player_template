@@ -130,13 +130,12 @@ class TransformerPlayer(Player):
         if not legal_moves:
             return None
 
-        prompt    = f"FEN: {fen}\nMove:"
+        prompt    = fen          # <-- changed from f"FEN: {fen}\nMove:"
         uci_moves = [m.uci() for m in legal_moves]
 
         try:
             scores = self._score_moves_batched(prompt, uci_moves)
         except Exception as e:
-            # Graceful fallback: score one by one (slower but safe)
             print(f"[{self.name}] Batched scoring failed ({e}), falling back to sequential.")
             scores = [self._score_move_single(prompt, uci) for uci in uci_moves]
 
