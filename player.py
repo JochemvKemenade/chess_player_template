@@ -1,14 +1,15 @@
 """
-TransformerPlayer — Magnus Carlsen-style chess player.
-Fine-tuned Qwen2.5-0.5B on Magnus Carlsen's Lichess games.
+TransformerPlayer, a Magnus Carlsen style chess player
+Fine-tuned Qwen2.5-0.5B on 400k Magnus Carlsen moves
 
-Scores all legal moves by log-probability under the model.
-Key optimisation: all legal moves are scored in a single batched
+How it works: 
+It Scores all legal moves by log-probability under the model.
+All legal moves are scored in a single batched
 forward pass, so inference is O(1) in the number of legal moves
-instead of O(N).  This keeps the tournament clock happy.
+instead of O(N).  This improves speed so tournament clock stays happy.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ARCHITECTURE OVERVIEW
+MODEL ARCHITECTURE OVERVIEW
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 get_move() is structured as a layered early-exit pipeline:
 
@@ -22,17 +23,26 @@ get_move() is structured as a layered early-exit pipeline:
   8.  Model scoring (batched) — core LM inference
   9.  Loop prevention         — post-scoring penalty on recently played moves
 
-Each layer either returns a move immediately (early exit) or narrows
+Each layer either returns a move immediately or narrows
 the candidate list passed to the next layer.  The model is only ever
-asked to score moves that have already survived the earlier filters —
-a smaller, cleaner question: "among tactically reasonable moves, which
-looks most like something Magnus would play?"
+asked to score moves that have already survived the earlier filters.
+
+Because grandmaster level chess games rarely end in checkmate, there was a lack
+of end-game strategy in the training data. In observing the model play chess 
+(there's a very cool library for visualising) I noted some weird behaviors that 
+I tried to remove with these heuristics. In my own testing with the chess colab
+it can quite reliably beat stockfish_weak!! That was a pretty cool moment.
+
+I've also organised some small tournaments in a friend group who all take the course,
+so I hope I win. Anyways good luck you who read this and good luck little magnus bot!
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
 from __future__ import annotations
 import time
 import chess
+import torch
+import torch.nn.functional as F
 from typing import Optional
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from chess_tournament.players import Player
@@ -49,8 +59,6 @@ MOVE_TIME_BUDGET = 5.0
 # HISTORY_DEPTH  — how many of our own past moves to look back through.
 # PENALTY_RECENT — penalty applied to a move played in the last 1-2 turns.
 # PENALTY_OLDER  — penalty applied to a move played 3-HISTORY_DEPTH turns ago.
-# Raise these values if loops persist; lower them if the bot becomes too
-# reluctant to repeat a genuinely good move.
 HISTORY_DEPTH  = 6
 PENALTY_RECENT = 4.0
 PENALTY_OLDER  = 2.0
@@ -60,8 +68,6 @@ class TransformerPlayer(Player):
 
     HF_MODEL_ID: str = "Jochemvkem/magnusbot-qwen"
     # Qwen2.5-0.5B fine-tuned on Magnus Carlsen's Lichess games.
-    # At 0.5B parameters it is fast enough for batched CPU inference but
-    # has a limited tactical ceiling — hence all the heuristic overrides.
 
     def __init__(self, name: str = "MagnusBot"):
         super().__init__(name)
@@ -74,18 +80,15 @@ class TransformerPlayer(Player):
         # Used by the position-based repetition penalty alongside move history.
         self._position_counts = defaultdict(int)
 
-        # Ordered list of UCI move strings we have played this game.
+        # Ordered list of UCI move strings magnusbot played this game.
         # Used by the move-history penalty to directly penalise recently
-        # repeated moves, catching A→B→A oscillations without needing to
-        # inspect board state.
+        # repeated moves, catching A→B→A oscillations
         self._move_history    = []
 
     def reset_game(self):
-        """
-        Clear all per-game state.
-        Call this at the start of every new game so history from a previous
-        game does not bleed into the next one.
-        """
+        # Clear all per-game state.
+        # Call this at the start of every new game so history from a previous
+        # game does not bleed into the next one.
         self._position_counts.clear()
         self._move_history.clear()
 
@@ -101,8 +104,6 @@ class TransformerPlayer(Player):
         """
         if self._model is not None:
             return
-
-        import torch
 
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[{self.name}] Loading model on {self._device} ...")
@@ -132,37 +133,6 @@ class TransformerPlayer(Player):
     # Core inference — batched log-prob scoring
     # ──────────────────────────────────────────────────────────────────────────
     def _score_moves_batched(self, prompt: str, uci_moves: list) -> list:
-        """
-        Score every move in uci_moves in a SINGLE forward pass.
-
-        Why batched?
-        ────────────
-        A naive implementation would call the model once per legal move.
-        With ~20-35 legal moves in a typical position that would be 20-35
-        serial forward passes — far too slow for tournament play.
-        By stacking all (prompt + move) sequences into one batch we pay the
-        forward-pass cost exactly once, regardless of how many moves there are.
-
-        How it works
-        ────────────
-        For each candidate move we construct:
-            full_text = "<FEN string> <uci_move>"
-
-        All sequences are left-padded to the same length so that the final
-        tokens (the move tokens) align across the batch.  Left-padding is
-        important here: the model reads left-to-right, so we want the move
-        tokens to sit at the same positions in every row of the batch tensor.
-
-        After one forward pass we read off, for each move, the sum of
-        log P(token_t | tokens_0..t-1) over just the move tokens.
-        This gives a log-probability score: how likely is the model to
-        generate this move given the FEN prompt?
-
-        A higher (less negative) score = the model thinks Magnus would be
-        more likely to play this move.
-        """
-        import torch
-        import torch.nn.functional as F
 
         tok = self._tokenizer
 
@@ -278,7 +248,7 @@ class TransformerPlayer(Player):
         """
         Return the best free capture available, or None.
 
-        Scans all captures for undefended enemy pieces — if we capture and the
+        Scans all captures for undefended enemy pieces. If we capture and the
         opponent cannot recapture, the piece was hanging and we take it for free.
         Returns the highest-value such capture, bypassing model scoring entirely.
 
@@ -332,7 +302,7 @@ class TransformerPlayer(Player):
         Return True when 6 or fewer major/minor pieces remain in total.
 
         The model is bypassed in endgames because the training data is heavily
-        weighted toward middlegame positions — most Lichess games end by
+        weighted toward middlegame positions. Most games end by
         resignation before a true endgame.  The explicit heuristic in
         _endgame_score encodes the three key endgame principles far more
         reliably than the model can.
@@ -349,7 +319,7 @@ class TransformerPlayer(Player):
         Heuristic scoring for endgame moves. Three components:
 
         1. Captures (10× piece value) — material gain dominates everything.
-        2. King proximity (14 - Chebyshev distance) — reward closing in on
+        2. King proximity (14) — reward closing in on
            the enemy king, which is essential for delivering checkmate.
         3. Pawn advancement (0.5 × rank) — reward pushing pawns toward
            promotion.
@@ -416,13 +386,8 @@ class TransformerPlayer(Player):
            Penalty = visit_count × 2.0
 
         Both penalties are summed. Using both gives loop detection at the move
-        level and the position level simultaneously.
-
-        Why soft penalties rather than hard bans?
-        A hard ban could eliminate all moves in a position the bot legitimately
-        needs to revisit.  The soft penalty makes repetition increasingly
-        unattractive the more times it has occurred, while still allowing it
-        if all alternatives score worse.
+        level and the position level simultaneously. Using soft bans prevents the 
+        model from not doing a move when it still scores high.
         """
         penalty = 0.0
 
@@ -445,11 +410,7 @@ class TransformerPlayer(Player):
     # ──────────────────────────────────────────────────────────────────────────
     def get_move(self, fen: str) -> Optional[str]:
         """
-        Main entry point — return the best UCI move string for the given FEN.
-
-        Executes the layered early-exit pipeline described in the module
-        docstring.  Each stage either returns immediately or passes a narrowed
-        candidate list to the next stage.
+        Main entry point, return the best UCI move string for the given FEN.
         """
         t0 = time.time()
         self._load()
@@ -464,10 +425,9 @@ class TransformerPlayer(Player):
         self._position_counts[self._position_key(board)] += 1
 
         # ── Step 1: Checkmate grab ─────────────────────────────────────────
-        # Hard rule — return any move that immediately ends the game.
+        # Return any move that immediately ends the game.
         # Bypasses all scoring. The training data underrepresents checkmate
-        # delivery (most Lichess games end by resignation) so the model cannot
-        # be trusted to find it reliably.
+        # delivery so the model cannot be trusted to find it reliably.
         for move in legal_moves:
             board.push(move)
             if board.is_checkmate():
@@ -476,7 +436,7 @@ class TransformerPlayer(Player):
             board.pop()
 
         # ── Step 2: Queen promotion ────────────────────────────────────────
-        # Hard rule — always promote to queen if the option exists.
+        # Always promote to queen if the option exists.
         # Promotions are rare in the training data and the model may miss them.
         for move in legal_moves:
             if move.promotion == chess.QUEEN:
@@ -489,7 +449,7 @@ class TransformerPlayer(Player):
         if non_draw_moves:
             legal_moves = non_draw_moves
 
-        # ── Step 4: Tactical override — free captures ──────────────────────
+        # ── Step 4: Tactical override for free captures ──────────────────────
         # Take the highest-value undefended enemy piece if one exists.
         # Fires before model scoring so the model never has to decide whether
         # to take free material.
