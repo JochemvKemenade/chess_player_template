@@ -28,6 +28,16 @@ PAD_ID   = 0
 START_ID = 1
 END_ID   = 2
 
+# ── Material values ────────────────────────────────────────────────────────────
+PIECE_VALUES: dict[int, int] = {
+    chess.PAWN:   1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK:   5,
+    chess.QUEEN:  9,
+    chess.KING:   0,
+}
+
 
 class TransformerPlayer(Player):
     """
