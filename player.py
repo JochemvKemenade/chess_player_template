@@ -5,16 +5,52 @@ import logging
 import yaml
 import chess
 import random
+import time
 import torch
 import torch.nn.functional as F
 
+from collections import defaultdict
 from huggingface_hub import hf_hub_download
 from chess_tournament.players import Player
+from typing import Optional
 
 
 REPO_ID = "Jochemvkem/magnusbot"
 
 logger = logging.getLogger(__name__)
+
+# ── Time budget ────────────────────────────────────────────────────────────────
+MOVE_TIME_BUDGET = 5.0
+
+# ── Heuristic bonuses (added to model score) ──────────────────────────────────
+BONUS_CHECKMATE       = 1000.0  # virtually guarantees checkmate is always chosen
+BONUS_QUEEN_PROMOTION =   20.0  # strongly prefer promoting to queen
+BONUS_FREE_CAPTURE    =    2.0  # multiplied by piece value for undefended captures
+BONUS_SACRIFICE       =    3.0  # capturing a more-valuable piece with a lesser one
+
+# ── Heuristic penalties (subtracted from model score) ─────────────────────────
+PENALTY_DRAW          =   10.0  # moves that lead to repetition / 50-move draw
+PENALTY_HANG          =    5.0  # moves that walk our piece into an attacked square
+
+# ── Endgame weight ─────────────────────────────────────────────────────────────
+# The endgame heuristic score (king proximity + pawn advancement + captures) is
+# multiplied by this and added to the model score when in an endgame position.
+ENDGAME_WEIGHT        =    1.5
+
+# ── Move history / loop penalties ─────────────────────────────────────────────
+HISTORY_DEPTH  = 6
+PENALTY_RECENT = 4.0
+PENALTY_OLDER  = 2.0
+
+# ── Material values ────────────────────────────────────────────────────────────
+PIECE_VALUES: dict[int, int] = {
+    chess.PAWN:   1,
+    chess.KNIGHT: 3,
+    chess.BISHOP: 3,
+    chess.ROOK:   5,
+    chess.QUEEN:  9,
+    chess.KING:   0,
+}
 
 
 def _load_module_from_path(module_name: str, file_path: str):
@@ -31,51 +67,34 @@ def _load_module_from_path(module_name: str, file_path: str):
 class TransformerPlayer(Player):
     """
     A chess player that uses a Transformer model downloaded from HuggingFace
-    to score and select legal moves.
+    to score and select legal moves, combined with a set of heuristic bonuses
+    and penalties to improve move quality.
 
-    Use the factory method `TransformerPlayer.from_hub()` to construct an instance.
-    Direct instantiation via `__init__` expects pre-loaded components and is
-    intended for testing or dependency injection.
+    Scoring pipeline:
+        score = model_log_prob
+              + BONUS_CHECKMATE        if the move delivers checkmate
+              + BONUS_QUEEN_PROMOTION  if the move promotes to queen
+              + BONUS_FREE_CAPTURE     × captured piece value  (undefended pieces)
+              + BONUS_SACRIFICE        if captured piece > moving piece in value
+              + ENDGAME_WEIGHT         × endgame_heuristic     if in endgame
+              - PENALTY_DRAW           if the move leads to a draw
+              - PENALTY_HANG           if the move walks our piece into an attack
+              - loop_penalty           based on move history and position counts
 
-    Note on inference cost: `score_legal_moves` runs O(move_length) forward
-    passes per group of same-length moves. This is intentional autoregressive
-    scoring and is acceptable for single-game inference throughput.
+    Initialise directly: `TransformerPlayer("MyBot")` — weights and config are
+    downloaded automatically from HuggingFace Hub inside `__init__`.
     """
 
     def __init__(
         self,
-        name: str,
-        model: torch.nn.Module,
-        tokenizer,
-        device: torch.device,
-        temperature: float = 1.0,
-    ):
-        super().__init__(name)
-        self.model       = model
-        self.tokenizer   = tokenizer
-        self.device      = device
-        self.temperature = temperature
-
-    # -------------------------
-    # Factory
-    # -------------------------
-
-    @classmethod
-    def from_hub(
-        cls,
         name: str = "MagnusBot",
         temperature: float = 1.0,
         repo_id: str = REPO_ID,
-    ) -> "TransformerPlayer":
-        """
-        Download scripts, config, and weights from HuggingFace and return a
-        fully initialised TransformerPlayer.
+    ):
+        super().__init__(name)
+        self.temperature = temperature
 
-        Artifacts are cached locally by `hf_hub_download`; subsequent calls
-        are fast when the cache is warm. Pass `local_files_only=True` (via
-        environment variable HF_HUB_OFFLINE=1) to enforce offline use.
-        """
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         # ── Step 1: download scripts from HF ──────────────────────────
         tok_path  = hf_hub_download(repo_id=repo_id, filename="scripts/tokenizer.py")
@@ -108,36 +127,43 @@ class TransformerPlayer(Player):
             settings = yaml.safe_load(f)
 
         # ── Step 4: build tokenizer ────────────────────────────────────
-        tokenizer = ChessTokenizer()
+        self.tokenizer = ChessTokenizer()
 
         # ── Step 5: build model ────────────────────────────────────────
-        model = Transformer(
-            src_vocab_size = tokenizer.vocab_size,
-            tgt_vocab_size = tokenizer.vocab_size,
+        # Infer num_layers from the checkpoint so architecture always matches.
+        state = torch.load(weights_path, map_location=self.device, weights_only=True)
+        if any(k.startswith("_orig_mod.") for k in state):
+            state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        indices    = {int(k.split(".")[1]) for k in state if k.startswith("encoder_layers")}
+        num_layers = max(indices) + 1 if indices else settings["num_layers"]
+
+        self.model = Transformer(
+            src_vocab_size = self.tokenizer.vocab_size,
+            tgt_vocab_size = self.tokenizer.vocab_size,
             d_model        = settings["d_model"],
             num_heads      = settings["num_heads"],
-            num_layers     = settings["num_layers"],
+            num_layers     = num_layers,
             d_ff           = settings["d_ff"],
             max_seq_length = 100,
             dropout        = settings["dropout"],
-        ).to(device)
+        ).to(self.device)
 
         # ── Step 6: load weights ───────────────────────────────────────
         # `weights_only=True` is a security measure: it prevents arbitrary code
         # execution that can occur when loading untrusted pickled checkpoints.
-        state = torch.load(weights_path, map_location=device, weights_only=True)
+        self.model.load_state_dict(state)
+        self.model.eval()
 
-        # Strip _orig_mod. prefix if the model was saved from a torch.compile'd run.
-        if any(k.startswith("_orig_mod.") for k in state):
-            state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        self._position_counts = defaultdict(int)
+        self._move_history    = []
 
-        model.load_state_dict(state)
-        model.eval()
+        logger.info("[%s] Ready on %s.", name, self.device)
+        print(f"[{name}] Ready on {self.device}.")
 
-        logger.info("[%s] Ready on %s.", name, device)
-        print(f"[{name}] Ready on {device}.")
-
-        return cls(name=name, model=model, tokenizer=tokenizer, device=device, temperature=temperature)
+    def reset_game(self):
+        """Reset per-game state (position counts and move history)."""
+        self._position_counts.clear()
+        self._move_history.clear()
 
     # -------------------------
     # Log-prob scoring
@@ -205,30 +231,199 @@ class TransformerPlayer(Player):
         return scores
 
     # -------------------------
+    # Heuristic adjustments
+    # -------------------------
+
+    @staticmethod
+    def _piece_value(piece: Optional[chess.Piece]) -> int:
+        if piece is None:
+            return 0
+        return PIECE_VALUES.get(piece.piece_type, 0)
+
+    def _heuristic_adjustment(self, board: chess.Board, move: chess.Move) -> float:
+        """
+        Compute the total heuristic adjustment for a single move.
+
+        Positive values make the move more attractive; negative values less so.
+        All signals are summed and returned as a single float to be added to the
+        model log-prob score.
+
+        Signals:
+          +BONUS_CHECKMATE        — move delivers immediate checkmate
+          +BONUS_QUEEN_PROMOTION  — move promotes a pawn to queen
+          +BONUS_FREE_CAPTURE × v — undefended enemy piece of value v captured
+          +BONUS_SACRIFICE        — captured piece is more valuable than ours
+          +ENDGAME_WEIGHT × h     — endgame positional heuristic h
+          -PENALTY_DRAW           — move leads to threefold repetition / 50-move
+          -PENALTY_HANG           — move places our piece on an attacked square
+          -loop_penalty           — move repeats recent history or revisits position
+        """
+        adjustment = 0.0
+        opponent   = not board.turn
+
+        # ── Checkmate bonus ────────────────────────────────────────────────
+        board.push(move)
+        is_mate = board.is_checkmate()
+        board.pop()
+        if is_mate:
+            return BONUS_CHECKMATE  # dominates everything; return early
+
+        # ── Draw penalty ───────────────────────────────────────────────────
+        board.push(move)
+        if board.is_repetition(count=3) or board.can_claim_fifty_moves():
+            adjustment -= PENALTY_DRAW
+        board.pop()
+
+        # ── Queen promotion bonus ──────────────────────────────────────────
+        if move.promotion == chess.QUEEN:
+            adjustment += BONUS_QUEEN_PROMOTION
+
+        # ── Capture bonuses ────────────────────────────────────────────────
+        if board.is_capture(move):
+            our_piece = board.piece_at(move.from_square)
+
+            # En-passant: the captured pawn is not on to_square.
+            if board.is_en_passant(move):
+                captured_value = PIECE_VALUES[chess.PAWN]
+            else:
+                captured_value = self._piece_value(board.piece_at(move.to_square))
+
+            # Free-capture bonus: scale with the value of the undefended piece.
+            board.push(move)
+            if not board.is_attacked_by(opponent, move.to_square):
+                adjustment += BONUS_FREE_CAPTURE * captured_value
+            board.pop()
+
+            # Sacrifice bonus: we give up a lesser piece to take a greater one.
+            if captured_value > self._piece_value(our_piece):
+                adjustment += BONUS_SACRIFICE
+
+        # ── Hang penalty ───────────────────────────────────────────────────
+        board.push(move)
+        if board.is_attacked_by(opponent, move.to_square):
+            adjustment -= PENALTY_HANG
+        board.pop()
+
+        # ── Endgame heuristic bonus ────────────────────────────────────────
+        if self._is_endgame(board):
+            adjustment += ENDGAME_WEIGHT * self._endgame_heuristic(board, move)
+
+        # ── Loop / repetition penalty ──────────────────────────────────────
+        adjustment -= self._loop_penalty(move.uci(), board, move)
+
+        return adjustment
+
+    # -------------------------
+    # Endgame helpers
+    # -------------------------
+
+    def _is_endgame(self, board: chess.Board) -> bool:
+        """Return True when 6 or fewer major/minor pieces remain."""
+        major_pieces = (chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT)
+        count = sum(
+            len(board.pieces(pt, chess.WHITE)) + len(board.pieces(pt, chess.BLACK))
+            for pt in major_pieces
+        )
+        return count <= 6
+
+    def _endgame_heuristic(self, board: chess.Board, move: chess.Move) -> float:
+        """
+        Positional score for endgame moves. Three components:
+          1. Captures    — 10× piece value
+          2. King proximity — reward closing in on the enemy king
+          3. Pawn advancement — reward pushing pawns toward promotion
+
+        board.turn flips after push(), so 'our' colour is `not board.turn` inside.
+        """
+        score = 0.0
+        board.push(move)
+
+        if board.is_capture(move):
+            score += self._piece_value(board.piece_at(move.to_square)) * 10
+
+        our_king_sq   = board.king(not board.turn)
+        enemy_king_sq = board.king(board.turn)
+        if our_king_sq and enemy_king_sq:
+            score += 14 - chess.square_distance(our_king_sq, enemy_king_sq)
+
+        our_color = not board.turn
+        for sq in board.pieces(chess.PAWN, our_color):
+            rank = chess.square_rank(sq)
+            score += (rank if our_color == chess.WHITE else 7 - rank) * 0.5
+
+        board.pop()
+        return score
+
+    # -------------------------
+    # Loop prevention
+    # -------------------------
+
+    @staticmethod
+    def _position_key(board: chess.Board) -> str:
+        return board.board_fen()
+
+    def _loop_penalty(self, uci: str, board: chess.Board, move: chess.Move) -> float:
+        """
+        Penalty from two independent signals:
+          1. Move history  — penalises recently repeated UCI move strings,
+                             catching A→B→A oscillations.
+          2. Position counts — penalises returning to positions seen this game,
+                               catching loops that travel different move paths.
+        """
+        penalty = 0.0
+
+        recent = self._move_history[-HISTORY_DEPTH:]
+        if uci in recent[-2:]:
+            penalty += PENALTY_RECENT
+        elif uci in recent:
+            penalty += PENALTY_OLDER
+
+        board.push(move)
+        penalty += self._position_counts[self._position_key(board)] * 2.0
+        board.pop()
+
+        return penalty
+
+    # -------------------------
     # Main API
     # -------------------------
 
     def get_move(self, fen: str) -> str | None:
-        board       = chess.Board(fen)
-        legal_moves = [m.uci() for m in board.legal_moves]
+        t0    = time.time()
+        board = chess.Board(fen)
+        legal_moves = list(board.legal_moves)
 
         if not legal_moves:
             return None
 
-        encoded_fen = self.tokenizer.encode(fen, is_target=False)
-        src_tensor  = torch.tensor(encoded_fen, dtype=torch.long).unsqueeze(0).to(self.device)
+        self._position_counts[self._position_key(board)] += 1
 
+        uci_moves   = [m.uci() for m in legal_moves]
+        src_tensor  = torch.tensor(
+            self.tokenizer.encode(fen, is_target=False), dtype=torch.long
+        ).unsqueeze(0).to(self.device)
+
+        # ── Model scoring ──────────────────────────────────────────────────
         try:
-            scores = self.score_legal_moves(src_tensor, legal_moves)
-            return max(scores, key=scores.get)
+            scores_dict = self.score_legal_moves(src_tensor, uci_moves)
+            scores      = [scores_dict[uci] for uci in uci_moves]
         except (ValueError, RuntimeError) as exc:
-            # ValueError: tokenizer vocab mismatch (logged as a warning — indicates
-            #   an unexpected position or model/tokenizer version mismatch).
-            # RuntimeError: GPU/tensor errors during the forward pass.
-            # Other exceptions (e.g. KeyboardInterrupt, OOM) are intentionally
-            # allowed to propagate so they are not silently swallowed.
             logger.warning(
                 "[%s] Falling back to random move due to scoring error: %s",
                 self.name, exc,
             )
-            return random.choice(legal_moves)
+            return random.choice(uci_moves)
+
+        # ── Heuristic adjustments ──────────────────────────────────────────
+        adjusted = [
+            score + self._heuristic_adjustment(board, move)
+            for score, move in zip(scores, legal_moves)
+        ]
+
+        best_idx = max(range(len(adjusted)), key=lambda i: adjusted[i])
+        chosen   = uci_moves[best_idx]
+
+        self._move_history.append(chosen)
+        logger.info("[%s] Move: %s | Time: %.2fs", self.name, chosen, time.time() - t0)
+        print(f"[{self.name}] Move: {chosen} | Time: {time.time() - t0:.2f}s")
+        return chosen
