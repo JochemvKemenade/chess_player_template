@@ -119,8 +119,7 @@ class TransformerPlayer(Player):
             num_layers     = settings["num_layers"],
             d_ff           = settings["d_ff"],
             max_seq_length = 100,
-            # Dropout is not set here; model.eval() below disables it properly.
-            # Hardcoding 0.0 would couple this constructor to training config.
+            dropout        = settings["dropout"],
         ).to(device)
 
         # ── Step 6: load weights ───────────────────────────────────────
