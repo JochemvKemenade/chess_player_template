@@ -1,206 +1,235 @@
+import os
+import sys
+import importlib.util
+import logging
+import yaml
 import chess
 import random
-import re
-import sys
-import os
-import yaml
 import torch
-from typing import Optional
+import torch.nn.functional as F
 
-from huggingface_hub import snapshot_download
-
-try:
-    from chess_tournament.players import Player
-except ImportError:
-    from abc import ABC, abstractmethod
-    class Player(ABC):
-        def __init__(self, name: str):
-            self.name = name
-        @abstractmethod
-        def get_move(self, fen: str) -> Optional[str]:
-            pass
+from huggingface_hub import hf_hub_download
+from chess_tournament.players import Player
 
 
 REPO_ID = "Jochemvkem/magnusbot"
 
-# Token IDs as defined in ChessTokenizer
-PAD_ID   = 0
-START_ID = 1
-END_ID   = 2
+logger = logging.getLogger(__name__)
 
-# ── Material values ────────────────────────────────────────────────────────────
-PIECE_VALUES: dict[int, int] = {
-    chess.PAWN:   1,
-    chess.KNIGHT: 3,
-    chess.BISHOP: 3,
-    chess.ROOK:   5,
-    chess.QUEEN:  9,
-    chess.KING:   0,
-}
+
+def _load_module_from_path(module_name: str, file_path: str):
+    """
+    Load a Python module directly from a file path without mutating sys.path.
+    This keeps the import fully scoped and avoids global side effects.
+    """
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class TransformerPlayer(Player):
     """
-    MagnusBot — custom encoder-decoder Transformer trained on chess positions.
+    A chess player that uses a Transformer model downloaded from HuggingFace
+    to score and select legal moves.
 
-    Downloads weights + scripts from HuggingFace on first use:
-        https://huggingface.co/Jochemvkem/magnusbot
+    Use the factory method `TransformerPlayer.from_hub()` to construct an instance.
+    Direct instantiation via `__init__` expects pre-loaded components and is
+    intended for testing or dependency injection.
 
-    Initializable with only a name, as required by the competition:
-        player = TransformerPlayer("MagnusBot")
+    Note on inference cost: `score_legal_moves` runs O(move_length) forward
+    passes per group of same-length moves. This is intentional autoregressive
+    scoring and is acceptable for single-game inference throughput.
     """
-
-    UCI_REGEX = re.compile(r"\b([a-h][1-8][a-h][1-8][qrbn]?)\b", re.IGNORECASE)
 
     def __init__(
         self,
-        name: str = "MagnusBot",
-        repo_id: str = REPO_ID,
-        max_new_tokens: int = 10,
-        retries: int = 5,
+        name: str,
+        model: torch.nn.Module,
+        tokenizer,
+        device: torch.device,
+        temperature: float = 1.0,
     ):
         super().__init__(name)
-        self.repo_id        = repo_id
-        self.max_new_tokens = max_new_tokens
-        self.retries        = retries
-        self.device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model       = model
+        self.tokenizer   = tokenizer
+        self.device      = device
+        self.temperature = temperature
 
-        self._model     = None
-        self._tokenizer = None
+    # -------------------------
+    # Factory
+    # -------------------------
 
-    # ------------------------------------------------------------------
-    # Lazy loading — downloads the full repo snapshot on first call
-    # ------------------------------------------------------------------
-    def _load(self):
-        if self._model is not None:
-            return
+    @classmethod
+    def from_hub(
+        cls,
+        name: str = "MagnusBot",
+        temperature: float = 1.0,
+        repo_id: str = REPO_ID,
+    ) -> "TransformerPlayer":
+        """
+        Download scripts, config, and weights from HuggingFace and return a
+        fully initialised TransformerPlayer.
 
-        print(f"[{self.name}] Downloading model from '{self.repo_id}'...")
-        local_dir = snapshot_download(repo_id=self.repo_id)
-        print(f"[{self.name}] Cached at: {local_dir}")
+        Artifacts are cached locally by `hf_hub_download`; subsequent calls
+        are fast when the cache is warm. Pass `local_files_only=True` (via
+        environment variable HF_HUB_OFFLINE=1) to enforce offline use.
+        """
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Make the repo's scripts/ package importable
-        if local_dir not in sys.path:
-            sys.path.insert(0, local_dir)
+        # ── Step 1: download scripts from HF ──────────────────────────
+        tok_path  = hf_hub_download(repo_id=repo_id, filename="scripts/tokenizer.py")
+        arch_path = hf_hub_download(repo_id=repo_id, filename="scripts/architecture.py")
 
-        from scripts.tokenizer    import ChessTokenizer  # noqa: E402
-        from scripts.architecture import Transformer     # noqa: E402
+        # ── Step 2: import without mutating sys.path ───────────────────
+        # The tokenizer module is loaded first under its own isolated name.
+        tokenizer_mod = _load_module_from_path("magnusbot.tokenizer", tok_path)
 
-        # Read hyper-parameters saved by the trainer
-        config_path = os.path.join(local_dir, "opt-configs.yml")
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        # architecture.py contains `from tokenizer import ChessTokenizer`, a bare
+        # import that only resolves if a module named "tokenizer" exists in
+        # sys.modules. We register our already-loaded module there temporarily so
+        # the import succeeds, then remove it immediately to avoid polluting the
+        # global module namespace for anything else in the process.
+        _TOKENIZER_ALIAS = "tokenizer"
+        sys.modules[_TOKENIZER_ALIAS] = tokenizer_mod
+        try:
+            architecture_mod = _load_module_from_path("magnusbot.architecture", arch_path)
+        finally:
+            sys.modules.pop(_TOKENIZER_ALIAS, None)
 
-        # Character-level tokenizer — vocab is fixed at construction
-        self._tokenizer = ChessTokenizer()
+        ChessTokenizer = tokenizer_mod.ChessTokenizer
+        Transformer    = architecture_mod.Transformer
 
-        # Rebuild the exact architecture used during training
+        # ── Step 3: download config and weights ───────────────────────
+        config_path  = hf_hub_download(repo_id=repo_id, filename="opt-configs.yml")
+        weights_path = hf_hub_download(repo_id=repo_id, filename="magnusbot.pth")
+
+        with open(config_path) as f:
+            settings = yaml.safe_load(f)
+
+        # ── Step 4: build tokenizer ────────────────────────────────────
+        tokenizer = ChessTokenizer()
+
+        # ── Step 5: build model ────────────────────────────────────────
         model = Transformer(
-            src_vocab_size=self._tokenizer.vocab_size,
-            tgt_vocab_size=self._tokenizer.vocab_size,
-            d_model=config["d_model"],
-            num_heads=config["num_heads"],
-            num_layers=config["num_layers"],
-            d_ff=config["d_ff"],
-            max_seq_length=100,
-            dropout=0.0,    # disable dropout at inference time
-        )
+            src_vocab_size = tokenizer.vocab_size,
+            tgt_vocab_size = tokenizer.vocab_size,
+            d_model        = settings["d_model"],
+            num_heads      = settings["num_heads"],
+            num_layers     = settings["num_layers"],
+            d_ff           = settings["d_ff"],
+            max_seq_length = 100,
+            # Dropout is not set here; model.eval() below disables it properly.
+            # Hardcoding 0.0 would couple this constructor to training config.
+        ).to(device)
 
-        weights_path = os.path.join(local_dir, "magnusbot.pth")
-        state_dict = torch.load(weights_path, map_location=self.device)
-        model.load_state_dict(state_dict)
-        model.to(self.device)
+        # ── Step 6: load weights ───────────────────────────────────────
+        # `weights_only=True` is a security measure: it prevents arbitrary code
+        # execution that can occur when loading untrusted pickled checkpoints.
+        state = torch.load(weights_path, map_location=device, weights_only=True)
+
+        # Strip _orig_mod. prefix if the model was saved from a torch.compile'd run.
+        if any(k.startswith("_orig_mod.") for k in state):
+            state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+
+        model.load_state_dict(state)
         model.eval()
 
-        self._model = model
-        print(f"[{self.name}] Ready on {self.device}.")
+        logger.info("[%s] Ready on %s.", name, device)
+        print(f"[{name}] Ready on {device}.")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-    def _random_legal(self, fen: str) -> Optional[str]:
-        try:
-            board = chess.Board(fen)
-            moves = list(board.legal_moves)
-            return random.choice(moves).uci() if moves else None
-        except Exception:
-            return None
+        return cls(name=name, model=model, tokenizer=tokenizer, device=device, temperature=temperature)
 
-    def _is_legal(self, fen: str, uci: str) -> bool:
-        try:
-            board = chess.Board(fen)
-            return chess.Move.from_uci(uci) in board.legal_moves
-        except Exception:
-            return False
+    # -------------------------
+    # Log-prob scoring
+    # -------------------------
 
-    def _extract_uci(self, text: str) -> Optional[str]:
-        m = self.UCI_REGEX.search(text)
-        return m.group(1).lower() if m else None
-
-    # ------------------------------------------------------------------
-    # Autoregressive decoding
-    # ------------------------------------------------------------------
-    def _decode(self, fen: str, sample: bool = False) -> Optional[str]:
+    def _encode_moves(self, legal_moves: list[str]) -> dict[str, list[int]]:
         """
-        Encode the FEN, then autoregressively decode a move token-by-token.
+        Encode each UCI move string into a list of token ids.
 
-        Source encoding uses encode(fen, is_target=False) — no START/END wrapping.
-        Target decoding starts with <START> (id=1) and stops at <END> (id=2).
-        Both behaviours match ChessDataset.__getitem__ exactly.
+        Raises ValueError if any character in a move is absent from the
+        tokenizer vocabulary, which would silently corrupt scoring otherwise.
         """
-        tok   = self._tokenizer
-        model = self._model
+        encoded = {}
+        for move in legal_moves:
+            tokens = []
+            for c in move:
+                if c not in self.tokenizer.char_to_int:
+                    raise ValueError(
+                        f"Character {c!r} in move {move!r} is not in the tokenizer "
+                        f"vocabulary. The model may be incompatible with this position."
+                    )
+                tokens.append(self.tokenizer.char_to_int[c])
+            encoded[move] = tokens
+        return encoded
 
-        # Encode FEN as source sequence (no START/END tokens)
-        src_ids = tok.encode(fen, is_target=False)
-        src = torch.tensor([src_ids], dtype=torch.long, device=self.device)  # (1, S)
+    def score_legal_moves(self, src_tensor: torch.Tensor, legal_moves: list[str]) -> dict[str, float]:
+        """
+        Score each legal move by summing the log-probabilities of its character
+        tokens under the model.
 
-        # Target starts with <START>
-        tgt_ids = [START_ID]
+        Moves are grouped by token length so a single batched forward pass is
+        used per character position within each length group, reducing the total
+        number of forward passes from O(n_moves × move_length) to
+        O(n_unique_lengths × max_move_length).
+        """
+        encoded = self._encode_moves(legal_moves)
+
+        # Group moves by length for batched scoring.
+        by_length: dict[int, list[str]] = {}
+        for move, tokens in encoded.items():
+            by_length.setdefault(len(tokens), []).append(move)
+
+        scores: dict[str, float] = {}
 
         with torch.no_grad():
-            for _ in range(self.max_new_tokens):
-                tgt = torch.tensor([tgt_ids], dtype=torch.long, device=self.device)
-                logits  = model(src, tgt)         # (1, T, vocab_size)
-                next_lg = logits[0, -1, :]        # (vocab_size,)
+            for length, group in by_length.items():
+                # Decoder input rows: [BOS, char0, char1, ...]
+                tgt_ids   = torch.tensor(
+                    [[1] + encoded[m] for m in group], dtype=torch.long
+                ).to(self.device)
+                src_batch = src_tensor.expand(len(group), -1)
 
-                if sample:
-                    probs   = torch.softmax(next_lg, dim=-1)
-                    top_k   = torch.topk(probs, k=5)
-                    choice  = torch.multinomial(top_k.values, num_samples=1)
-                    next_id = top_k.indices[choice].item()
-                else:
-                    next_id = next_lg.argmax().item()
+                log_probs = torch.zeros(len(group), device=self.device)
 
-                if next_id == END_ID:
-                    break
-                tgt_ids.append(next_id)
+                for i in range(length):
+                    # Feed BOS + characters seen so far; predict the next character.
+                    output         = self.model(src_batch, tgt_ids[:, :i + 1])
+                    step_log_probs = F.log_softmax(output[:, -1, :] / self.temperature, dim=-1)
+                    next_token     = tgt_ids[:, i + 1].unsqueeze(1)
+                    log_probs     += step_log_probs.gather(1, next_token).squeeze(1)
 
-        # tok.decode skips PAD/START and stops at END automatically
-        raw = tok.decode(tgt_ids[1:])
-        return self._extract_uci(raw) if raw else None
+                for move, lp in zip(group, log_probs.tolist()):
+                    scores[move] = lp
 
-    # ------------------------------------------------------------------
-    # Public API — required by the competition
-    # ------------------------------------------------------------------
-    def get_move(self, fen: str) -> Optional[str]:
+        return scores
+
+    # -------------------------
+    # Main API
+    # -------------------------
+
+    def get_move(self, fen: str) -> str | None:
+        board       = chess.Board(fen)
+        legal_moves = [m.uci() for m in board.legal_moves]
+
+        if not legal_moves:
+            return None
+
+        encoded_fen = self.tokenizer.encode(fen, is_target=False)
+        src_tensor  = torch.tensor(encoded_fen, dtype=torch.long).unsqueeze(0).to(self.device)
+
         try:
-            self._load()
-        except Exception as e:
-            print(f"[{self.name}] Model load failed ({e}). Using random fallback.")
-            return self._random_legal(fen)
-
-        for attempt in range(1, self.retries + 1):
-            try:
-                # Attempt 1: greedy (deterministic best guess)
-                # Attempts 2+: top-5 sampling (explore alternatives)
-                move = self._decode(fen, sample=(attempt > 1))
-
-                if move and self._is_legal(fen, move):
-                    return move
-
-            except Exception as e:
-                print(f"[{self.name}] Attempt {attempt} error: {e}")
-
-        # Final fallback — random legal move so the player is never disqualified
-        return self._random_legal(fen)
+            scores = self.score_legal_moves(src_tensor, legal_moves)
+            return max(scores, key=scores.get)
+        except (ValueError, RuntimeError) as exc:
+            # ValueError: tokenizer vocab mismatch (logged as a warning — indicates
+            #   an unexpected position or model/tokenizer version mismatch).
+            # RuntimeError: GPU/tensor errors during the forward pass.
+            # Other exceptions (e.g. KeyboardInterrupt, OOM) are intentionally
+            # allowed to propagate so they are not silently swallowed.
+            logger.warning(
+                "[%s] Falling back to random move due to scoring error: %s",
+                self.name, exc,
+            )
+            return random.choice(legal_moves)

@@ -30,7 +30,7 @@ pip install -e .
 ```python
 from player import TransformerPlayer
 
-p = TransformerPlayer("MyBot")
-move = p.get_move("starting FEN")
+player = TransformerPlayer.from_hub("MagnusBot")  # downloads weights from HF
+move = player.get_move("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
 print(move)
 ```

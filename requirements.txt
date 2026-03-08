@@ -1,3 +1,5 @@
 python-chess
 torch
 transformers
+huggingface_hub
+pyyaml
